@@ -192,8 +192,8 @@ flowchart TD
 ### Steps
 1.  **Clone the repository (if you haven't already):**
     ```bash
-    git clone https://github.com/OWASP/owasp-social-osintlm.git
-    cd owasp-social-osintlm
+    git clone https://github.com/bm-github/SocialOSINTLM.git
+    cd SocialOSINTLM
     ```
 2.  **Install dependencies:**
     ```bash
@@ -271,15 +271,13 @@ flowchart TD
 ## 🚀 Usage
 
 ### Interactive Mode
-Run the script from the project's root directory using the `-m` flag to ensure all modules are loaded correctly:
+Run the script without arguments to start the interactive CLI session:
 ```bash
-# Make sure you are in the project's root directory
-python -m socialosintlm.main
+python socialosintlm.py
 ```
 Add the `--offline` flag to run the session using only cached data:
 ```bash
-# To run in offline mode
-python -m socialosintlm.main --offline
+python socialosintlm.py --offline
 ```
 1.  You'll be prompted to select platform(s). You can also choose "Purge Data" from this menu.
 2.  Enter the username(s) for each selected platform (comma-separated if multiple).
@@ -297,7 +295,7 @@ python -m socialosintlm.main --offline
 5.  **Offline Mode Behavior:** In offline mode, the tool will only load data from the local cache (`data/cache/`). If no cache exists for a requested user/platform, analysis for that target will be skipped (a warning will be shown). No new data is fetched from social platforms, and *no new media is downloaded or analyzed*.
 
 ### Programmatic Mode (via Stdin)
-Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing. Remember to run it as a module from the project root.
+Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
 
 ```bash
 echo '{
@@ -313,7 +311,7 @@ echo '{
     "hackernews": "pg"
   },
   "query": "Analyze the primary topics of discussion and any indications of technical expertise across these accounts. Are there notable differences in communication style between platforms for the same individual, if applicable?"
-}' | python -m socialosintlm.main --stdin
+}' | python socialosintlm.py --stdin
 ```
 Combine with `--offline` to use only cached data:
 ```bash
@@ -323,7 +321,7 @@ echo '{
     "reddit": ["user3"]
   },
   "query": "Summarize cached activity."
-}' | python -m socialosintlm.main --stdin --offline
+}' | python socialosintlm.py --stdin --offline
 ```
 When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries, or if the analysis results in an error.
 
