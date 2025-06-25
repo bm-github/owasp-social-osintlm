@@ -382,10 +382,16 @@ class SocialOSINTLM:
                 raise ValueError("Invalid JSON: 'platforms' (dict) and 'query' (str) required.")
             query_platforms = {p: [sanitize_username(u.strip()) for u in (us if isinstance(us,list) else [us]) if u.strip()] for p, us in platforms.items() if p in self.get_available_platforms()}
             if not query_platforms: raise ValueError("No valid/configured platforms found in input.")
-            report = self.analyze(query_platforms, query)
+            
+            # Pass the stderr console to analyze() so all progress indicators go there
+            report = self.analyze(query_platforms, query, console=stderr)
+            
             if not report.strip().lower().startswith("[red]"):
-                if self.args.no_auto_save: print(report)
-                else: self._save_output(report, query, list(query_platforms.keys()), self.args.format)
+                if self.args.no_auto_save: 
+                    # Print final report to standard output
+                    print(report)
+                else: 
+                    self._save_output(report, query, list(query_platforms.keys()), self.args.format)
                 sys.exit(0)
             else:
                 sys.stderr.write(f"Analysis Error:\n{report}\n")
