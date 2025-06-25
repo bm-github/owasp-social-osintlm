@@ -192,7 +192,7 @@ flowchart TD
 ### Steps
 1.  **Clone the repository (if you haven't already):**
     ```bash
-    git clone https://github.com/bm-github/owasp-social-osintlm.git
+    git clone https://github.com/OWASP/owasp-social-osintlm.git
     cd owasp-social-osintlm
     ```
 2.  **Install dependencies:**
