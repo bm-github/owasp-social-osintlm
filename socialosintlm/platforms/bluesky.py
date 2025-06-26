@@ -15,8 +15,8 @@ from ..utils import SUPPORTED_IMAGE_EXTENSIONS, download_media, get_sort_key
 
 logger = logging.getLogger("SocialOSINTLM.platforms.bluesky")
 
-INITIAL_FETCH_LIMIT = 50
-INCREMENTAL_FETCH_LIMIT = 50
+# Default used if no count is specified in the fetch plan
+DEFAULT_FETCH_LIMIT = 50
 
 def fetch_data(
     client: Client,
@@ -24,6 +24,7 @@ def fetch_data(
     cache: CacheManager,
     llm: LLMAnalyzer,
     force_refresh: bool = False,
+    fetch_limit: int = DEFAULT_FETCH_LIMIT,
 ) -> Optional[Dict[str, Any]]:
     """Fetches posts and user profile for a Bluesky user."""
     
@@ -33,12 +34,16 @@ def fetch_data(
         return cached_data or {"timestamp": datetime.now(timezone.utc).isoformat(), "profile_info": {}, "posts": [], "media_analysis": [], "media_paths": [], "stats": {}}
 
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        return cached_data
+        if len(cached_data.get("posts", [])) >= fetch_limit:
+            return cached_data
 
-    logger.info(f"Fetching Bluesky data for {username} (Force Refresh: {force_refresh})")
+    logger.info(f"Fetching Bluesky data for {username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
     
     existing_posts = cached_data.get("posts", []) if not force_refresh and cached_data else []
-    latest_post_datetime = get_sort_key(existing_posts[0], "created_at") if existing_posts else None
+    # Only check for new posts if we aren't trying to "load more"
+    use_incremental_fetch = not force_refresh and fetch_limit <= len(existing_posts)
+    latest_post_datetime = get_sort_key(existing_posts[0], "created_at") if use_incremental_fetch and existing_posts else None
+
     profile_info = cached_data.get("profile_info") if not force_refresh and cached_data else None
     existing_media_analysis = cached_data.get("media_analysis", []) if not force_refresh and cached_data else []
     existing_media_paths = cached_data.get("media_paths", []) if not force_refresh and cached_data else []
@@ -61,7 +66,7 @@ def fetch_data(
         
         cursor = None
         total_fetched = 0
-        max_fetches = INITIAL_FETCH_LIMIT if (force_refresh or not latest_post_datetime) else INCREMENTAL_FETCH_LIMIT
+        max_fetches = fetch_limit
 
         auth_details = {"access_jwt": getattr(client._session, 'access_jwt', None)}
 
@@ -76,7 +81,8 @@ def fetch_data(
                 
                 created_at_dt = get_sort_key({"created_at": getattr(record, "created_at", None)}, "created_at")
 
-                if not force_refresh and latest_post_datetime and created_at_dt <= latest_post_datetime:
+                # If doing incremental, stop when we see a post we already have.
+                if latest_post_datetime and created_at_dt <= latest_post_datetime:
                     cursor = "STOP" # Signal to stop
                     break
                 
@@ -100,7 +106,7 @@ def fetch_data(
             cursor = response.cursor
 
         combined = new_posts_data + existing_posts
-        final_posts = sorted(list({p['uri']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)
+        final_posts = sorted(list({p['uri']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
         final_media_analysis = sorted(list(set(newly_added_media_analysis + existing_media_analysis)))
         final_media_paths = sorted(list(newly_added_media_paths.union(existing_media_paths)))
 
@@ -111,7 +117,7 @@ def fetch_data(
             "avg_likes": round(sum(p.get("likes", 0) for p in final_posts) / max(1, len(final_posts)), 2)
         }
 
-        final_data = {"profile_info": profile_info, "posts": final_posts[:MAX_CACHE_ITEMS], "stats": stats, "media_analysis": final_media_analysis, "media_paths": final_media_paths[:MAX_CACHE_ITEMS*2]}
+        final_data = {"profile_info": profile_info, "posts": final_posts, "stats": stats, "media_analysis": final_media_analysis, "media_paths": final_media_paths[:MAX_CACHE_ITEMS*2]}
         cache.save("bluesky", username, final_data)
         return final_data
 
@@ -132,7 +138,7 @@ def fetch_data(
         logger.error(f"Unexpected error fetching Bluesky data for {username}: {e}", exc_info=True)
         return None
 
-# Helper functions for Bluesky data processing
+# Helper functions for Bluesky data processing (unchanged)
 def _get_reply_info(record: Any, client: Client, did_cache: Dict[str, str]) -> Dict[str, Any]:
     reply_ref = getattr(record, "reply", None)
     if not reply_ref: return {}

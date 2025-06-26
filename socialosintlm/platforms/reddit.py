@@ -14,7 +14,8 @@ from ..utils import SUPPORTED_IMAGE_EXTENSIONS, download_media, get_sort_key
 
 logger = logging.getLogger("SocialOSINTLM.platforms.reddit")
 
-INCREMENTAL_FETCH_LIMIT = 50
+# Default used if no count is specified in the fetch plan
+DEFAULT_FETCH_LIMIT = 50
 
 def fetch_data(
     client: praw.Reddit,
@@ -22,6 +23,7 @@ def fetch_data(
     cache: CacheManager,
     llm: LLMAnalyzer,
     force_refresh: bool = False,
+    fetch_limit: int = DEFAULT_FETCH_LIMIT,
 ) -> Optional[Dict[str, Any]]:
     """Fetches submissions, comments, and user profile for a Reddit user."""
     
@@ -34,14 +36,21 @@ def fetch_data(
             return {"timestamp": datetime.now(timezone.utc).isoformat(), "user_profile": {}, "submissions": [], "comments": [], "media_analysis": [], "media_paths": [], "stats": {}}
 
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        return cached_data
+        # If the user has enough items cached, return the cache
+        if len(cached_data.get("submissions", [])) >= fetch_limit and len(cached_data.get("comments", [])) >= fetch_limit:
+            return cached_data
 
-    logger.info(f"Fetching Reddit data for u/{username} (Force Refresh: {force_refresh})")
+    logger.info(f"Fetching Reddit data for u/{username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
     
     existing_submissions = cached_data.get("submissions", []) if not force_refresh and cached_data else []
     existing_comments = cached_data.get("comments", []) if not force_refresh and cached_data else []
-    latest_submission_fullname = existing_submissions[0].get("fullname") if existing_submissions else None
-    latest_comment_fullname = existing_comments[0].get("fullname") if existing_comments else None
+    
+    # Only use 'before' for incremental if we're not trying to fetch more than we already have
+    use_incremental_subs = not force_refresh and fetch_limit <= len(existing_submissions)
+    use_incremental_comments = not force_refresh and fetch_limit <= len(existing_comments)
+
+    latest_submission_fullname = existing_submissions[0].get("fullname") if use_incremental_subs and existing_submissions else None
+    latest_comment_fullname = existing_comments[0].get("fullname") if use_incremental_comments and existing_comments else None
     
     user_profile = cached_data.get("user_profile") if not force_refresh and cached_data else None
     existing_media_analysis = cached_data.get("media_analysis", []) if not force_refresh and cached_data else []
@@ -62,8 +71,8 @@ def fetch_data(
 
         # Fetch submissions
         new_submissions = []
-        params_subs = {"limit": INCREMENTAL_FETCH_LIMIT}
-        if not force_refresh and latest_submission_fullname:
+        params_subs = {"limit": fetch_limit}
+        if latest_submission_fullname:
             params_subs["before"] = latest_submission_fullname
         for s in redditor.submissions.new(**params_subs):
             media_items = []
@@ -99,8 +108,8 @@ def fetch_data(
         
         # Fetch comments
         new_comments = []
-        params_comments = {"limit": INCREMENTAL_FETCH_LIMIT}
-        if not force_refresh and latest_comment_fullname:
+        params_comments = {"limit": fetch_limit}
+        if latest_comment_fullname:
             params_comments["before"] = latest_comment_fullname
         for c in redditor.comments.new(**params_comments):
             parent_author = c.submission.author.name if hasattr(c.submission, 'author') and c.submission.author else None

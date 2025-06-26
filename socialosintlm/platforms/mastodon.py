@@ -14,7 +14,8 @@ from ..utils import SUPPORTED_IMAGE_EXTENSIONS, download_media, get_sort_key
 
 logger = logging.getLogger("SocialOSINTLM.platforms.mastodon")
 
-MASTODON_FETCH_LIMIT = 40
+# Default used if no count is specified in the fetch plan
+DEFAULT_FETCH_LIMIT = 40
 
 def fetch_data(
     clients: Dict[str, Mastodon],
@@ -22,7 +23,8 @@ def fetch_data(
     username: str, # user@instance.domain
     cache: CacheManager,
     llm: LLMAnalyzer,
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    fetch_limit: int = DEFAULT_FETCH_LIMIT
 ) -> Optional[Dict[str, Any]]:
     """Fetches statuses and user info for a Mastodon user."""
     
@@ -35,9 +37,10 @@ def fetch_data(
         return cached_data or {"timestamp": datetime.now(timezone.utc).isoformat(), "user_info": {}, "posts": [], "media_analysis": [], "media_paths": [], "stats": {}}
 
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        return cached_data
+        if len(cached_data.get("posts", [])) >= fetch_limit:
+            return cached_data
 
-    logger.info(f"Fetching Mastodon data for {username} (Force Refresh: {force_refresh})")
+    logger.info(f"Fetching Mastodon data for {username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
     
     instance_domain = username.split('@')[1]
     client_to_use = clients.get(f"https://{instance_domain}") or default_client
@@ -45,7 +48,7 @@ def fetch_data(
         raise RuntimeError(f"No suitable Mastodon client found for instance {instance_domain} or for default lookup.")
 
     existing_posts = cached_data.get("posts", []) if not force_refresh and cached_data else []
-    since_id = existing_posts[0].get("id") if existing_posts else None
+    since_id = existing_posts[0].get("id") if existing_posts and fetch_limit <= len(existing_posts) else None
     user_info = cached_data.get("user_info") if not force_refresh and cached_data else None
     existing_media_analysis = cached_data.get("media_analysis", []) if not force_refresh and cached_data else []
     existing_media_paths = cached_data.get("media_paths", []) if not force_refresh and cached_data else []
@@ -63,7 +66,10 @@ def fetch_data(
             }
         
         user_id = user_info["id"]
-        new_statuses = client_to_use.account_statuses(id=user_id, limit=MASTODON_FETCH_LIMIT, since_id=since_id if not force_refresh else None)
+        # The Mastodon API has a hard limit of 40 per request.
+        # To fetch more, pagination would be required. For now, we respect the API limit.
+        api_limit = min(fetch_limit, 40) 
+        new_statuses = client_to_use.account_statuses(id=user_id, limit=api_limit, since_id=since_id if not force_refresh else None)
         
         new_posts_data = []
         newly_added_media_analysis = []
@@ -99,7 +105,7 @@ def fetch_data(
             new_posts_data.append(post_data)
 
         combined = new_posts_data + existing_posts
-        final_posts = sorted(list({p['id']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)
+        final_posts = sorted(list({p['id']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
         final_media_analysis = sorted(list(set(newly_added_media_analysis + existing_media_analysis)))
         final_media_paths = sorted(list(newly_added_media_paths.union(existing_media_paths)))
 
@@ -110,7 +116,7 @@ def fetch_data(
             "posts_with_media": len([p for p in final_posts if p.get("media")]),
         }
 
-        final_data = {"user_info": user_info, "posts": final_posts[:MAX_CACHE_ITEMS], "stats": stats, "media_analysis": final_media_analysis, "media_paths": final_media_paths[:MAX_CACHE_ITEMS*2]}
+        final_data = {"user_info": user_info, "posts": final_posts, "stats": stats, "media_analysis": final_media_analysis, "media_paths": final_media_paths[:MAX_CACHE_ITEMS*2]}
         cache.save("mastodon", username, final_data)
         return final_data
 

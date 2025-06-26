@@ -74,7 +74,10 @@ class SocialOSINTLM:
             if not token: raise RuntimeError("TWITTER_BEARER_TOKEN not set.")
             self._twitter = tweepy.Client(bearer_token=token, wait_on_rate_limit=False)
             if not self.args.offline:
-                self._twitter.get_user(username="twitterdev", user_fields=["id"])
+                try:
+                    self._twitter.get_user(username="twitterdev", user_fields=["id"])
+                except tweepy.errors.TweepyException as e:
+                    logger.warning(f"Could not verify Twitter client credentials: {e}")
         return self._twitter
 
     @property
@@ -97,7 +100,10 @@ class SocialOSINTLM:
                 raise RuntimeError("Bluesky credentials not set.")
             client = Client()
             if not self.args.offline:
-                client.login(os.environ["BLUESKY_IDENTIFIER"], os.environ["BLUESKY_APP_SECRET"])
+                try:
+                    client.login(os.environ["BLUESKY_IDENTIFIER"], os.environ["BLUESKY_APP_SECRET"])
+                except atproto_exceptions.AtProtocolError as e:
+                    logger.warning(f"Could not verify Bluesky client credentials: {e}")
             self._bluesky = client
         return self._bluesky
 
@@ -200,12 +206,20 @@ class SocialOSINTLM:
         available.append("hackernews")
         return sorted(list(set(available)))
 
-    def analyze(self, platforms: Dict[str, List[str]], query: str, force_refresh: bool = False) -> str:
+    def analyze(self, platforms: Dict[str, List[str]], query: str, force_refresh: bool = False, fetch_options: Optional[Dict[str, Any]] = None, console: Optional[Console] = None) -> str:
         collected_data: Dict[str, List[Dict]] = {p: [] for p in platforms}
         failed_fetches = []
         total_targets = sum(len(v) for v in platforms.values())
-        with Progress(SpinnerColumn(), "[progress.description]{task.description}", transient=True, console=self.console) as progress:
+        
+        # Use the provided console or the default one
+        progress_console = console or self.console
+
+        with Progress(SpinnerColumn(), "[progress.description]{task.description}", transient=True, console=progress_console) as progress:
             task = progress.add_task("[cyan]Collecting data...", total=total_targets)
+            
+            fetch_options = fetch_options or {}
+            default_count = fetch_options.get("default_count", 50)
+
             for platform, usernames in platforms.items():
                 fetcher = FETCHERS.get(platform)
                 if not fetcher: failed_fetches.append((platform, "all", "N/A")); progress.advance(task, len(usernames)); continue
@@ -213,9 +227,15 @@ class SocialOSINTLM:
                     progress.update(task, description=f"[cyan]Fetching {platform}/{username}...")
                     try:
                         client = self.get_platform_client(platform)
-                        kwargs = {'username': username, 'cache': self.cache, 'llm': self.llm, 'force_refresh': force_refresh}
+                        
+                        target_key = f"{platform}:{username}"
+                        target_opts = fetch_options.get("targets", {}).get(target_key, {})
+                        limit = target_opts.get("count", default_count)
+
+                        kwargs = {'username': username, 'cache': self.cache, 'llm': self.llm, 'force_refresh': force_refresh, 'fetch_limit': limit}
                         if platform == "mastodon": kwargs['clients'], kwargs['default_client'] = client
                         elif platform != "hackernews": kwargs['client'] = client
+                        
                         data = fetcher(**kwargs)
                         if data: collected_data[platform].append({"username_key": username, "data": data})
                         else: failed_fetches.append((platform, username, "No data (check offline/cache)"))
@@ -229,10 +249,12 @@ class SocialOSINTLM:
                         failed_fetches.append((platform, username, "Unexpected Error"))
                     finally:
                         progress.advance(task)
+                        
         if failed_fetches:
             self.console.print("[yellow]Data collection issues:[/yellow]")
             for p, u, r in failed_fetches: self.console.print(f"- {p}/{u}: {r}")
         if not any(collected_data.values()): return "[red]Data collection failed for all targets.[/red]"
+
         with self.console.status("[magenta]Analyzing with LLM..."):
             try:
                 report = self.llm.run_analysis(collected_data, query)
@@ -315,7 +337,17 @@ class SocialOSINTLM:
                         self.console.print(Text("Cache check: ", style="dim") + Text.from_markup(", ".join([f"{u} {self._get_cache_info_string(p,u)}" for u in users])))
                         query_platforms[p] = users
                 if not query_platforms: self.console.print("[yellow]No users entered.[/yellow]"); continue
-                self._run_analysis_loop(query_platforms)
+                
+                default_count_str = Prompt.ask("Enter default number of items to fetch per target", default="50")
+                try:
+                    default_count = int(default_count_str)
+                except ValueError:
+                    default_count = 50
+                    self.console.print("[yellow]Invalid number, using 50.[/yellow]")
+                
+                fetch_options = {"default_count": default_count, "targets": {}}
+                
+                self._run_analysis_loop(query_platforms, fetch_options)
             
             except (KeyboardInterrupt, EOFError):
                 self.console.print("\n[yellow]Operation cancelled.[/yellow]")
@@ -324,30 +356,61 @@ class SocialOSINTLM:
                 else:
                     continue
 
-    def _run_analysis_loop(self, platforms: Dict[str, List[str]]):
+    def _run_analysis_loop(self, platforms: Dict[str, List[str]], fetch_options: Dict[str, Any]):
         platform_info = " | ".join([f"{p.capitalize()}: {', '.join(u)}" for p, u in platforms.items()])
-        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`", title="🔎 Analysis Session", border_style="cyan", expand=False))
+        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`, `loadmore <platform/user> <count>`", title="🔎 Analysis Session", border_style="cyan", expand=False))
         last_query = ""
         while True:
             try:
                 query = Prompt.ask("\n[bold green]Analysis Query>[/bold green]", default=last_query).strip()
                 if not query: continue
-                last_query = query
-                cmd = query.lower()
-                if cmd == "exit": break
-                if cmd == "help": self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`help`: Show this message.", title="Help")); continue
                 
+                cmd = query.lower()
                 force_refresh = False
-                if cmd == "refresh":
+
+                if cmd == "exit": break
+                if cmd == "help":
+                    self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`loadmore <platform/user> <count>`: Fetch additional items for a target (e.g., `loadmore twitter/elonmusk 100`).\n`help`: Show this message.", title="Help"))
+                    continue
+                
+                if cmd.startswith("loadmore "):
+                    if self.args.offline: self.console.print("[yellow]'loadmore' is unavailable in offline mode.[/yellow]"); continue
+                    try:
+                        _, target, count_str = cmd.split()
+                        platform, username = target.split('/')
+                        count_to_add = int(count_str)
+                        if platform not in platforms or username not in platforms.get(platform,[]):
+                             self.console.print(f"[red]Error: Target '{target}' is not part of the current session.[/red]")
+                             continue
+                        
+                        target_key = f"{platform}:{username}"
+                        target_opts = fetch_options.get("targets", {})
+                        current_count = target_opts.get(target_key, {}).get("count", fetch_options.get("default_count", 50))
+                        new_count = current_count + count_to_add
+                        
+                        if "targets" not in fetch_options: fetch_options["targets"] = {}
+                        fetch_options["targets"][target_key] = {"count": new_count}
+
+                        self.console.print(f"[cyan]Fetch plan updated for {target}: will now fetch up to {new_count} items. Re-running last query...[/cyan]")
+                        force_refresh = True # Force a fetch to get the new items
+                        query = last_query # Use the previous query
+                        if not query:
+                            self.console.print("[yellow]No previous query to run. Please enter a new query.[/yellow]")
+                            continue
+                    except (ValueError, IndexError):
+                        self.console.print("[red]Invalid `loadmore` format. Use: `loadmore <platform/user> <count>`[/red]")
+                        continue
+
+                elif cmd == "refresh":
                     if self.args.offline: self.console.print("[yellow]'refresh' is unavailable in offline mode.[/yellow]"); continue
                     if Confirm.ask("Force refresh data for all targets? This uses more API calls.", default=False):
                         force_refresh = True
                         query = Prompt.ask("Enter analysis query for refreshed data", default=last_query if last_query != "refresh" else "").strip()
                         if not query: self.console.print("[yellow]Refresh cancelled, no query entered.[/yellow]"); continue
-                        last_query = query
                     else: continue
                 
-                result = self.analyze(platforms, query, force_refresh)
+                last_query = query
+                result = self.analyze(platforms, query, force_refresh, fetch_options)
                 
                 is_error = result.strip().lower().startswith("[red]")
                 border_color = "red" if is_error else "green"
@@ -378,13 +441,14 @@ class SocialOSINTLM:
         try:
             data = json.load(sys.stdin)
             platforms, query = data.get("platforms"), data.get("query")
+            fetch_options = data.get("fetch_options") # New: read fetch options
             if not isinstance(platforms, dict) or not platforms or not isinstance(query, str) or not query.strip():
                 raise ValueError("Invalid JSON: 'platforms' (dict) and 'query' (str) required.")
             query_platforms = {p: [sanitize_username(u.strip()) for u in (us if isinstance(us,list) else [us]) if u.strip()] for p, us in platforms.items() if p in self.get_available_platforms()}
             if not query_platforms: raise ValueError("No valid/configured platforms found in input.")
             
-            # Pass the stderr console to analyze() so all progress indicators go there
-            report = self.analyze(query_platforms, query, console=stderr)
+            # Pass the stderr console and fetch_options to analyze()
+            report = self.analyze(query_platforms, query, fetch_options=fetch_options, console=stderr)
             
             if not report.strip().lower().startswith("[red]"):
                 if self.args.no_auto_save: 

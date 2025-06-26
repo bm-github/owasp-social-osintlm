@@ -14,12 +14,17 @@ from ..utils import get_sort_key
 logger = logging.getLogger("SocialOSINTLM.platforms.hackernews")
 
 REQUEST_TIMEOUT = 20.0
+# Default used if no count is specified in the fetch plan
+DEFAULT_FETCH_LIMIT = 100
+# Algolia API has a max of 1000 hits per page
+ALGOLIA_MAX_HITS = 1000
 
 def fetch_data(
     username: str,
     cache: CacheManager,
     llm: LLMAnalyzer, # Not used, but kept for consistent signature
     force_refresh: bool = False,
+    fetch_limit: int = DEFAULT_FETCH_LIMIT,
 ) -> Optional[Dict[str, Any]]:
     """Fetches user activity from HackerNews via Algolia API."""
     
@@ -28,17 +33,24 @@ def fetch_data(
         return cached_data or {"timestamp": datetime.now(timezone.utc).isoformat(), "items": [], "stats": {}}
 
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        return cached_data
+        if len(cached_data.get("items", [])) >= fetch_limit:
+            return cached_data
 
-    logger.info(f"Fetching HackerNews data for {username} (Force Refresh: {force_refresh})")
+    logger.info(f"Fetching HackerNews data for {username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
     
     existing_items = cached_data.get("items", []) if not force_refresh and cached_data else []
-    latest_timestamp_i = max((item.get("created_at_i", 0) for item in existing_items), default=0)
+    
+    # Only use incremental fetch if we're not force refreshing AND not trying to "load more"
+    use_incremental_fetch = not force_refresh and fetch_limit <= len(existing_items)
+    latest_timestamp_i = max((item.get("created_at_i", 0) for item in existing_items), default=0) if use_incremental_fetch else 0
 
     try:
         base_url = "https://hn.algolia.com/api/v1/search_by_date"
-        params: Dict[str, Any] = {"tags": f"author_{quote_plus(username)}", "hitsPerPage": 100}
-        if not force_refresh and latest_timestamp_i > 0:
+        params: Dict[str, Any] = {
+            "tags": f"author_{quote_plus(username)}", 
+            "hitsPerPage": min(fetch_limit, ALGOLIA_MAX_HITS)
+        }
+        if latest_timestamp_i > 0:
             params["numericFilters"] = f"created_at_i>{latest_timestamp_i}"
 
         new_items_data = []
@@ -66,7 +78,7 @@ def fetch_data(
             new_items_data.append(item_data)
             
         combined = new_items_data + existing_items
-        final_items = sorted(list({i['objectID']: i for i in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)
+        final_items = sorted(list({i['objectID']: i for i in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
         
         story_items = [s for s in final_items if s.get("type") == "story"]
         comment_items = [c for c in final_items if c.get("type") == "comment"]
@@ -78,7 +90,7 @@ def fetch_data(
             "average_comment_points": round(sum(c.get("points", 0) or 0 for c in comment_items) / max(1, len(comment_items)), 2),
         }
 
-        final_data = {"items": final_items[:MAX_CACHE_ITEMS], "stats": stats}
+        final_data = {"items": final_items, "stats": stats}
         cache.save("hackernews", username, final_data)
         return final_data
 
