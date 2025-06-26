@@ -2,10 +2,20 @@
   "platforms": {
     "twitter": ["twitterhandle"],
     "reddit": ["reddithandle", "reddithandle2"],
-    "hackernews": ["hackernewshandle"],
+    "hackernews": ["pg"],
     "bluesky": ["handle.bsky.social", "handle2.bsky.social"],
     "mastodon": ["handle@mastodon.social"]
   },
-  "query": "Summarize main topics discussed and analyze sentiment across platforms.",
-  "format": "markdown"
+  "query": "Summarize main topics discussed and analyze sentiment across platforms",
+  "fetch_options": {
+    "default_count": 50,
+    "targets": {
+      "twitter:twitterhandle": {
+        "count": 200
+      },
+      "reddit:reddithandle": {
+        "count": 75
+      }
+    }
+  }
 }

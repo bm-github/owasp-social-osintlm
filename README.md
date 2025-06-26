@@ -1,6 +1,6 @@
-# 🚀 SocialOSINTLM
+# 🚀 owasp-social-osintlm
 
-**SocialOSINTLM** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon (multi-instance), and Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
+**owasp-social-osintlm** is a powerful Python-based tool designed for Open Source Intelligence (OSINT) gathering and analysis. It aggregates and analyzes user activity across multiple social media platforms, including **Twitter / X, Reddit, Hacker News (via Algolia), Mastodon (multi-instance), and Bluesky**. Leveraging AI through OpenAI-compatible APIs (e.g., OpenRouter, OpenAI, self-hosted models), it provides comprehensive insights into user engagement, content themes, behavioral patterns, and media content analysis.
 
 ## 🌟 Key Features
 
@@ -20,6 +20,8 @@
 
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`.
 
+✅ Configurable Fetch Plan: Fetches a default number of recent items (e.g., 50), which can be precisely controlled per-target using an interactive prompt or a "Fetch Plan" in programmatic mode.
+
 ✅ **Offline Mode (`--offline`):** Run analysis using only locally cached data, ignores cache expiry, skipping all external network requests (social platforms, media downloads, *new* vision analysis).
 
 ✅ **Interactive CLI:** User-friendly command-line interface with rich formatting (`rich`) for platform selection, user input, and displaying results.
@@ -37,7 +39,7 @@
 ```mermaid
 flowchart TD
     %% Initialization
-    A([Start SocialOSINTLM]) --> AA{{Setup Directories & API Clients<br/>Verify Environment}}
+    A([Start owasp-social-osintlm]) --> AA{{Setup Directories & API Clients<br/>Verify Environment}}
     
     %% Mode Selection
     AA --> B{Interactive or<br/>Stdin Mode?}
@@ -192,8 +194,8 @@ flowchart TD
 ### Steps
 1.  **Clone the repository (if you haven't already):**
     ```bash
-    git clone https://github.com/bm-github/SocialOSINTLM.git
-    cd SocialOSINTLM
+    git clone https://github.com/bm-github/owasp-social-osintlm.git
+    cd owasp-social-osintlm
     ```
 2.  **Install dependencies:**
     ```bash
@@ -217,7 +219,7 @@ flowchart TD
 
     # --- Optional: OpenRouter Specific Headers (if LLM_API_BASE_URL is OpenRouter) ---
     # OPENROUTER_REFERER="http://localhost:3000"
-    # OPENROUTER_X_TITLE="SocialOSINTLM"
+    # OPENROUTER_X_TITLE="owasp-social-osintlm"
 
     # --- Platform API Keys (as needed) ---
     # Twitter/X
@@ -240,7 +242,7 @@ flowchart TD
     *Note: HackerNews does not require API keys.*
 
     **b. Mastodon Instance Configuration (JSON file):**
-    If using Mastodon, create a JSON file (e.g., `mastodon_instances.json` in the `data/` directory or the script's current working directory, or specify a custom path in `.env` via `MASTODON_CONFIG_FILE`).
+    If using Mastodon, create a JSON file (e.g., `mastodon_instances.json` in the script's current working directory, or specify a custom path in `.env` via `MASTODON_CONFIG_FILE`).
 
     **Example `mastodon_instances.json`:**
     ```json
@@ -271,58 +273,51 @@ flowchart TD
 ## 🚀 Usage
 
 ### Interactive Mode
-Run the script without arguments to start the interactive CLI session:
+Run the script as a module from the project root to start the interactive CLI.
 ```bash
-python socialosintlm.py
+python -m socialosintlm.main
 ```
-Add the `--offline` flag to run the session using only cached data:
-```bash
-python socialosintlm.py --offline
-```
-1.  You'll be prompted to select platform(s). You can also choose "Purge Data" from this menu.
-2.  Enter the username(s) for each selected platform (comma-separated if multiple).
+1.  You'll be prompted to select one or more platforms.
+2.  Enter the username(s) for the selected platform(s).
     *   **Twitter:** Usernames *without* the leading `@`.
     *   **Reddit:** Usernames *without* the leading `u/`.
-    *   **Hacker News:** Usernames as they appear.
-    *   **Bluesky:** Full handles including `.bsky.social` (or custom domain).
-    *   **Mastodon:** Full handles in `user@instance.domain` format. If an instance is missing for a username and a default Mastodon lookup instance is configured (via `is_default_lookup_instance: true` in your JSON), the tool will prompt to assume the user is on that default instance.
-3.  Once platforms/users are selected, you enter an analysis loop for that session. Enter your analysis queries (e.g., "analyze recent activity patterns", "Identify key interests", "Assess communication style").
-4.  **Commands within the analysis loop:**
-    *   `refresh`: Clears the cache for the current users/platforms and fetches fresh data. **Note: This command is disabled in offline mode (`--offline`).**
+    *   **Hacker News:** Case-sensitive usernames as they appear.
+    *   **Bluesky:** Full handles (e.g., `handle.bsky.social`).
+    *   **Mastodon:** Full handles in `user@instance.domain` format.
+3.  Enter the default number of items to fetch per target (e.g., `50`).
+4.  Once in the analysis session, enter your queries.
+5.  **Special commands within the analysis loop:**
+    *   `loadmore <platform/user> <count>`: Fetch additional items for a target (e.g., `loadmore twitter/user101 100`).
+    *   `refresh`: Re-fetch data for all targets, ignoring the 24-hour cache.
     *   `help`: Displays available commands.
-    *   `exit`: Exits the current analysis session and returns to the platform selection menu.
-    *   Press `Ctrl+C` to potentially exit the program (will prompt for confirmation).
-5.  **Offline Mode Behavior:** In offline mode, the tool will only load data from the local cache (`data/cache/`). If no cache exists for a requested user/platform, analysis for that target will be skipped (a warning will be shown). No new data is fetched from social platforms, and *no new media is downloaded or analyzed*.
+    *   `exit`: Returns to the main platform selection menu.
+6.  **Offline Mode Behavior:** In offline mode, the tool will only load data from the local cache (`data/cache/`). If no cache exists for a requested user/platform, analysis for that target will be skipped (a warning will be shown). No new data is fetched from social platforms, and *no new media is downloaded or analyzed*.
 
 ### Programmatic Mode (via Stdin)
 Provide input as a JSON object via standard input using the `--stdin` flag. This is useful for scripting or batch processing.
 
+**Example `stdin` Request with a "Fetch Plan":**
 ```bash
 echo '{
   "platforms": {
-    "twitter": ["someTwitterUser", "anotherXAccount"],
-    "reddit": "aRedditUsername",
-    "mastodon": [
-      "user1@mastodon.social",
-      "researcher@example2.org",
-      "curious@some.other.instance"
-    ],
-    "bluesky": "handle.bsky.social",
-    "hackernews": "pg"
+    "twitter": ["user101"],
+    "reddit": ["handle1"]
   },
-  "query": "Analyze the primary topics of discussion and any indications of technical expertise across these accounts. Are there notable differences in communication style between platforms for the same individual, if applicable?"
-}' | python socialosintlm.py --stdin
+  "query": "Compare the communication style of the twitter account and the Reddit user.",
+  "fetch_options": {
+    "default_count": 50,
+    "targets": {
+      "twitter:user101": {
+        "count": 200
+      }
+    }
+  }
+}' | python -m socialosintlm.main --stdin
 ```
+*   In this example, the script fetches **200** tweets for `twitter:user101` (the override) and **50** items for `reddit:handle1` (the `default_count`).
+
 Combine with `--offline` to use only cached data:
-```bash
-echo '{
-  "platforms": {
-    "twitter": ["user1", "user2"],
-    "reddit": ["user3"]
-  },
-  "query": "Summarize cached activity."
-}' | python socialosintlm.py --stdin --offline
-```
+
 When using `--stdin --offline`, only cached data will be used. If a platform/user has no cache entry, it will be skipped. The tool will exit with a non-zero status code if *no* data could be loaded for *any* requested target due to missing cache entries, or if the analysis results in an error.
 
 ### Command-line Arguments

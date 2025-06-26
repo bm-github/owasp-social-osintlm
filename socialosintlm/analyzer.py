@@ -5,7 +5,7 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import humanize
 import praw
@@ -355,62 +355,123 @@ class SocialOSINTLM:
                     break
                 else:
                     continue
+    
+    def _handle_loadmore_command(self, parts: List[str], platforms: Dict[str, List[str]], fetch_options: Dict[str, Any], last_query: str) -> Tuple[bool, str, bool]:
+        """
+        Handles all logic for the 'loadmore' command.
+
+        Returns:
+            Tuple[bool, str, bool]: A tuple of (should_run_analysis, query_to_run, force_refresh)
+        """
+        # --- 1. Basic command structure validation ---
+        if len(parts) not in [2, 3]:
+            self.console.print("[red]Invalid `loadmore` format. Use: `loadmore <count>` or `loadmore <platform/user> <count>`[/red]")
+            return False, "", False
+
+        # --- 2. Parse arguments ---
+        target_str, count_str = (parts[1], parts[2]) if len(parts) == 3 else (None, parts[1])
+
+        # --- 3. Validate count ---
+        try:
+            count_to_add = int(count_str)
+        except ValueError:
+            self.console.print(f"[red]Invalid count: '{count_str}'. Must be a number.[/red]")
+            return False, "", False
+
+        # --- 4. Resolve target if not explicitly provided ---
+        if not target_str:
+            all_targets = [f"{p}/{u}" for p, users in platforms.items() for u in users]
+            if len(all_targets) == 1:
+                target_str = all_targets[0]
+            elif len(all_targets) > 1:
+                self.console.print("[cyan]Multiple targets active. Please choose one:[/cyan]")
+                prompt_choices = {str(i): t for i, t in enumerate(all_targets, 1)}
+                for i_str, t in prompt_choices.items(): self.console.print(f" {i_str}. {t}")
+                choice = Prompt.ask("Enter number", choices=list(prompt_choices.keys()), show_choices=False)
+                target_str = prompt_choices.get(choice)
+            else:
+                self.console.print("[red]Error: No active targets in the session.[/red]")
+                return False, "", False
+        
+        if not target_str: # User cancelled the prompt
+            return False, "", False
+
+        # --- 5. Validate final target string ---
+        try:
+            platform, username = target_str.split('/', 1)
+        except ValueError:
+            self.console.print(f"[red]Invalid target format: '{target_str}'. Expected 'platform/username'.[/red]")
+            return False, "", False
+
+        if platform not in platforms or username not in platforms.get(platform, []):
+            self.console.print(f"[red]Error: Target '{target_str}' is not part of the current session.[/red]")
+            return False, "", False
+
+        # --- 6. Update fetch options ---
+        target_key = f"{platform}:{username}"
+        current_count = fetch_options.get("targets", {}).get(target_key, {}).get("count", fetch_options.get("default_count", 50))
+        new_count = current_count + count_to_add
+        
+        if "targets" not in fetch_options: fetch_options["targets"] = {}
+        if target_key not in fetch_options["targets"]: fetch_options["targets"][target_key] = {}
+        fetch_options["targets"][target_key]["count"] = new_count
+        
+        # --- 7. Decide next action ---
+        if last_query:
+            self.console.print(f"[cyan]Fetch plan updated for {target_str} to {new_count} items. Re-running last query...[/cyan]")
+            return True, last_query, True
+        else:
+            self.console.print(f"[cyan]Fetch plan updated for {target_str} to {new_count} items. Please enter an analysis query.[/cyan]")
+            return False, "", False
 
     def _run_analysis_loop(self, platforms: Dict[str, List[str]], fetch_options: Dict[str, Any]):
         platform_info = " | ".join([f"{p.capitalize()}: {', '.join(u)}" for p, u in platforms.items()])
-        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`, `loadmore <platform/user> <count>`", title="🔎 Analysis Session", border_style="cyan", expand=False))
+        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`, `loadmore <count>` or `loadmore <platform/user> <count>`", title="🔎 Analysis Session", border_style="cyan", expand=False))
         last_query = ""
         while True:
             try:
-                query = Prompt.ask("\n[bold green]Analysis Query>[/bold green]", default=last_query).strip()
-                if not query: continue
-                
-                cmd = query.lower()
+                user_input = Prompt.ask("\n[bold green]Analysis Query>[/bold green]", default=last_query).strip()
+                if not user_input: continue
+
+                parts = user_input.split()
+                command = parts[0].lower() if parts else ""
+
                 force_refresh = False
+                should_run_analysis = False
+                query_to_run = ""
 
-                if cmd == "exit": break
-                if cmd == "help":
-                    self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`loadmore <platform/user> <count>`: Fetch additional items for a target (e.g., `loadmore twitter/elonmusk 100`).\n`help`: Show this message.", title="Help"))
+                # --- COMMAND ROUTER ---
+                if command == "exit":
+                    break
+                elif command == "help":
+                    self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`loadmore <count>`: Add items for the sole target, or choose from a list.\n`loadmore <platform/user> <count>`: Explicitly add items for a target (e.g., `loadmore twitter/elonmusk 100`).\n`help`: Show this message.", title="Help"))
                     continue
-                
-                if cmd.startswith("loadmore "):
-                    if self.args.offline: self.console.print("[yellow]'loadmore' is unavailable in offline mode.[/yellow]"); continue
-                    try:
-                        _, target, count_str = cmd.split()
-                        platform, username = target.split('/')
-                        count_to_add = int(count_str)
-                        if platform not in platforms or username not in platforms.get(platform,[]):
-                             self.console.print(f"[red]Error: Target '{target}' is not part of the current session.[/red]")
-                             continue
-                        
-                        target_key = f"{platform}:{username}"
-                        target_opts = fetch_options.get("targets", {})
-                        current_count = target_opts.get(target_key, {}).get("count", fetch_options.get("default_count", 50))
-                        new_count = current_count + count_to_add
-                        
-                        if "targets" not in fetch_options: fetch_options["targets"] = {}
-                        fetch_options["targets"][target_key] = {"count": new_count}
-
-                        self.console.print(f"[cyan]Fetch plan updated for {target}: will now fetch up to {new_count} items. Re-running last query...[/cyan]")
-                        force_refresh = True # Force a fetch to get the new items
-                        query = last_query # Use the previous query
-                        if not query:
-                            self.console.print("[yellow]No previous query to run. Please enter a new query.[/yellow]")
-                            continue
-                    except (ValueError, IndexError):
-                        self.console.print("[red]Invalid `loadmore` format. Use: `loadmore <platform/user> <count>`[/red]")
+                elif command == "refresh":
+                    if self.args.offline:
+                        self.console.print("[yellow]'refresh' is unavailable in offline mode.[/yellow]")
                         continue
-
-                elif cmd == "refresh":
-                    if self.args.offline: self.console.print("[yellow]'refresh' is unavailable in offline mode.[/yellow]"); continue
                     if Confirm.ask("Force refresh data for all targets? This uses more API calls.", default=False):
                         force_refresh = True
-                        query = Prompt.ask("Enter analysis query for refreshed data", default=last_query if last_query != "refresh" else "").strip()
-                        if not query: self.console.print("[yellow]Refresh cancelled, no query entered.[/yellow]"); continue
-                    else: continue
+                        query_to_run = Prompt.ask("Enter analysis query for refreshed data", default=last_query if last_query != "refresh" else "").strip()
+                        if query_to_run:
+                            should_run_analysis = True
+                        else:
+                            self.console.print("[yellow]Refresh cancelled, no query entered.[/yellow]")
+                    continue
+                elif command == "loadmore":
+                    should_run_analysis, query_to_run, force_refresh = self._handle_loadmore_command(
+                        parts, platforms, fetch_options, last_query
+                    )
+                else: # Not a recognized command, so it's a query
+                    query_to_run = user_input
+                    should_run_analysis = True
+
+                # --- ANALYSIS EXECUTION ---
+                if not should_run_analysis:
+                    continue
                 
-                last_query = query
-                result = self.analyze(platforms, query, force_refresh, fetch_options)
+                last_query = query_to_run
+                result = self.analyze(platforms, query_to_run, force_refresh, fetch_options)
                 
                 is_error = result.strip().lower().startswith("[red]")
                 border_color = "red" if is_error else "green"
@@ -419,10 +480,10 @@ class SocialOSINTLM:
                 
                 if not is_error:
                     if not self.args.no_auto_save:
-                        self._save_output(result, query, list(platforms.keys()), self.args.format)
+                        self._save_output(result, query_to_run, list(platforms.keys()), self.args.format)
                     elif Confirm.ask("Save report?"):
                         save_format = Prompt.ask("Format?", choices=["markdown", "json"], default=self.args.format)
-                        self._save_output(result, query, list(platforms.keys()), save_format)
+                        self._save_output(result, query_to_run, list(platforms.keys()), save_format)
 
             except (KeyboardInterrupt, EOFError):
                 self.console.print("\n[yellow]Analysis query cancelled.[/yellow]")
