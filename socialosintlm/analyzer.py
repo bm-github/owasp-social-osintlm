@@ -180,7 +180,9 @@ class SocialOSINTLM:
                 ts_str = data.get("timestamp", "N/A")
                 age = self._format_cache_age(ts_str) if ts_str != "N/A" else "N/A"
                 counts = {"twitter": f"{len(data.get('tweets',[]))}t", "reddit": f"{len(data.get('submissions',[]))}s, {len(data.get('comments',[]))}c", "bluesky": f"{len(data.get('posts',[]))}p", "mastodon": f"{len(data.get('posts',[]))}p", "hackernews": f"{len(data.get('items',[]))}i"}
-                media = f"{len([m for m in data.get('media_analysis',[]) if m])}/{len(data.get('media_paths',[]))}"
+                media_analyzed = len([m for m in data.get('media_analysis', []) if m and m.strip()])
+                media_found = len(data.get('media_paths', []))
+                media = f"{media_analyzed}/{media_found}"
                 table.add_row(platform.capitalize(), username, ts_str[:19], age, counts.get(platform, "N/A"), media)
             except Exception as e: logger.error(f"Error processing {file.name} for status: {e}")
         self.console.print(table)
@@ -328,7 +330,7 @@ class SocialOSINTLM:
                     elif p == "bluesky": prompt_msg += ", e.g., 'handle.bsky.social')"
                     elif p == "mastodon": prompt_msg += ", format: 'user@instance.domain')"
                     else: prompt_msg += ")"
-                    if self.args.offline: prompt_msg += " - OFFLINE, cache only)"
+                    if self.args.offline: prompt_msg += " - OFLINE, cache only)"
                     
                     users_input = Prompt.ask(prompt_msg)
                     if not users_input: continue
@@ -426,7 +428,7 @@ class SocialOSINTLM:
 
     def _run_analysis_loop(self, platforms: Dict[str, List[str]], fetch_options: Dict[str, Any]):
         platform_info = " | ".join([f"{p.capitalize()}: {', '.join(u)}" for p, u in platforms.items()])
-        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`, `loadmore <count>` or `loadmore <platform/user> <count>`", title="🔎 Analysis Session", border_style="cyan", expand=False))
+        self.console.print(Panel(f"Targets: {platform_info}\nCommands: `exit`, `refresh`, `help`, `loadmore [<platform/user>] <count>`", title="🔎 Analysis Session", border_style="cyan", expand=False))
         last_query = ""
         while True:
             try:
@@ -444,7 +446,7 @@ class SocialOSINTLM:
                 if command == "exit":
                     break
                 elif command == "help":
-                    self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`loadmore <count>`: Add items for the sole target, or choose from a list.\n`loadmore <platform/user> <count>`: Explicitly add items for a target (e.g., `loadmore twitter/elonmusk 100`).\n`help`: Show this message.", title="Help"))
+                    self.console.print(Panel("`exit`: Return to menu.\n`refresh`: Force full data fetch.\n`loadmore <count>`: Add items for the sole target, or choose from a list.\n`loadmore <platform/user> <count>`: Explicitly add items for a target (e.g., `loadmore twitter/user001 100`).\n`help`: Show this message.", title="Help"))
                     continue
                 elif command == "refresh":
                     if self.args.offline:

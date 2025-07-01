@@ -15,7 +15,6 @@ from ..utils import SUPPORTED_IMAGE_EXTENSIONS, download_media, get_sort_key
 
 logger = logging.getLogger("SocialOSINTLM.platforms.bluesky")
 
-# Default used if no count is specified in the fetch plan
 DEFAULT_FETCH_LIMIT = 50
 
 def fetch_data(
@@ -33,17 +32,22 @@ def fetch_data(
     if cache.is_offline:
         return cached_data or {"timestamp": datetime.now(timezone.utc).isoformat(), "profile_info": {}, "posts": [], "media_analysis": [], "media_paths": [], "stats": {}}
 
+    cached_posts_count = len(cached_data.get("posts", [])) if cached_data else 0
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        if len(cached_data.get("posts", [])) >= fetch_limit:
+        if cached_posts_count >= fetch_limit:
+            logger.info(f"Bluesky cache for {username} is fresh and has enough items ({cached_posts_count}/{fetch_limit}). Skipping fetch.")
             return cached_data
 
     logger.info(f"Fetching Bluesky data for {username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
     
     existing_posts = cached_data.get("posts", []) if not force_refresh and cached_data else []
-    # Only check for new posts if we aren't trying to "load more"
-    use_incremental_fetch = not force_refresh and fetch_limit <= len(existing_posts)
-    latest_post_datetime = get_sort_key(existing_posts[0], "created_at") if use_incremental_fetch and existing_posts else None
-
+    
+    # --- Efficiency Fix ---
+    # Only perform an incremental update (check for NEWER posts) if we are not trying to "load more".
+    # Otherwise, we will paginate backwards to get OLDER posts.
+    is_incremental_update = not force_refresh and cached_data and fetch_limit <= cached_posts_count
+    latest_post_datetime = get_sort_key(existing_posts[0], "created_at") if is_incremental_update and existing_posts else None
+    
     profile_info = cached_data.get("profile_info") if not force_refresh and cached_data else None
     existing_media_analysis = cached_data.get("media_analysis", []) if not force_refresh and cached_data else []
     existing_media_paths = cached_data.get("media_paths", []) if not force_refresh and cached_data else []
@@ -59,34 +63,43 @@ def fetch_data(
                 "posts_count": profile.posts_count, "labels": labels_list
             }
 
-        new_posts_data = []
+        all_fetched_posts = list(existing_posts) # Start with what we have
+        post_uris = {p['uri'] for p in all_fetched_posts}
+        
         newly_added_media_analysis = []
         newly_added_media_paths = set()
         did_to_handle_cache: Dict[str, str] = {profile_info["did"]: profile_info["handle"]}
         
         cursor = None
-        total_fetched = 0
-        max_fetches = fetch_limit
-
-        auth_details = {"access_jwt": getattr(client._session, 'access_jwt', None)}
-
-        while total_fetched < max_fetches:
-            response = client.get_author_feed(actor=username, cursor=cursor, limit=min(max_fetches - total_fetched, 100))
-            if not response or not response.feed: break
+        
+        # Keep fetching until we meet the desired limit
+        while len(all_fetched_posts) < fetch_limit:
+            response = client.get_author_feed(actor=username, cursor=cursor, limit=min(fetch_limit - len(all_fetched_posts), 100))
+            if not response or not response.feed:
+                logger.debug(f"No more posts found for {username} via API.")
+                break
             
+            page_had_new_posts = False
             for feed_item in response.feed:
                 post = feed_item.post
+                
+                # If we're doing an incremental update, stop when we see a post we've already processed.
+                if is_incremental_update and post.uri in post_uris:
+                    cursor = "STOP" # Signal to stop fetching pages
+                    break
+
+                # Skip duplicates if we're doing a loadmore
+                if post.uri in post_uris:
+                    continue
+
+                page_had_new_posts = True
+                post_uris.add(post.uri)
                 record = cast(Any, post.record)
-                if not record: continue # Skip if post has no record data
+                if not record: continue
                 
                 created_at_dt = get_sort_key({"created_at": getattr(record, "created_at", None)}, "created_at")
 
-                # If doing incremental, stop when we see a post we already have.
-                if latest_post_datetime and created_at_dt <= latest_post_datetime:
-                    cursor = "STOP" # Signal to stop
-                    break
-                
-                media_items, did_to_handle_cache = _process_post_media(record, post, cache, llm, username, auth_details, newly_added_media_paths, newly_added_media_analysis)
+                media_items, _ = _process_post_media(record, post, cache, llm, username, {"access_jwt": getattr(client._session, 'access_jwt', None)}, newly_added_media_paths, newly_added_media_analysis)
                 
                 reply_info = _get_reply_info(record, client, did_to_handle_cache)
                 embed_info = _get_embed_info(record, client, did_to_handle_cache)
@@ -99,14 +112,25 @@ def fetch_data(
                     "reposts": post.repost_count, "reply_count": post.reply_count,
                     "media": media_items, "mentions": mentions, **reply_info, **embed_info
                 }
-                new_posts_data.append(post_data)
-                total_fetched += 1
-            
-            if cursor == "STOP" or not response.cursor: break
-            cursor = response.cursor
+                all_fetched_posts.append(post_data)
 
-        combined = new_posts_data + existing_posts
-        final_posts = sorted(list({p['uri']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
+            if cursor == "STOP":
+                break
+                
+            # If a full page was processed and no new posts were added, we are done.
+            if not page_had_new_posts and len(response.feed) > 0:
+                logger.debug("Fetched a page with no new posts, stopping.")
+                break
+
+            cursor = response.cursor
+            if not cursor:
+                break
+            
+            # For incremental updates, we only need to fetch the first page to get the newest stuff.
+            if is_incremental_update:
+                break
+
+        final_posts = sorted(all_fetched_posts, key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
         final_media_analysis = sorted(list(set(newly_added_media_analysis + existing_media_analysis)))
         final_media_paths = sorted(list(newly_added_media_paths.union(existing_media_paths)))
 
@@ -122,23 +146,20 @@ def fetch_data(
         return final_data
 
     except atproto_exceptions.AtProtocolError as e:
-        # Correctly check for rate limit using isinstance
         if isinstance(e, atproto_exceptions.RateLimitExceeded):
             raise RateLimitExceededError("Bluesky API rate limit exceeded.") from e
-            
         err_str = str(e).lower()
         if "profile not found" in err_str or "could not resolve handle" in err_str:
             raise UserNotFoundError(f"Bluesky user {username} not found.") from e
         if "blocked by actor" in err_str:
             raise AccessForbiddenError(f"Access to Bluesky user {username} is blocked.") from e
-            
         logger.error(f"Bluesky API error for {username}: {e}")
         return None
     except Exception as e:
         logger.error(f"Unexpected error fetching Bluesky data for {username}: {e}", exc_info=True)
         return None
 
-# Helper functions for Bluesky data processing (unchanged)
+# (Helper functions _get_reply_info, etc., remain unchanged)
 def _get_reply_info(record: Any, client: Client, did_cache: Dict[str, str]) -> Dict[str, Any]:
     reply_ref = getattr(record, "reply", None)
     if not reply_ref: return {}
@@ -202,7 +223,7 @@ def _process_post_media(record: Any, post: Any, cache: CacheManager, llm: LLMAna
                 cdn_url = f"https://cdn.bsky.app/img/feed_fullsize/plain/{post.author.did}/{quote_plus(str(cid))}@{mime_type}"
                 media_path = download_media(cache.base_dir, cdn_url, cache.is_offline, "bluesky", auth)
                 if media_path:
-                    analysis = llm.analyze_image(media_path, f"Bluesky user {username}'s post") if media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS else None
+                    analysis = llm.analyze_image(media_path, source_url=cdn_url, context=f"Bluesky user {username}'s post") if media_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS else None
                     media_items.append({"type": "image", "analysis": analysis, "url": cdn_url, "alt_text": image_info.alt, "local_path": str(media_path)})
                     if analysis: analyses.append(analysis)
                     paths.add(str(media_path))

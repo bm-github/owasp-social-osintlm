@@ -1,4 +1,5 @@
 import base64
+import collections
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -15,7 +17,8 @@ from openai.types.chat import ChatCompletion
 from PIL import Image
 
 from .exceptions import RateLimitExceededError
-from .utils import SUPPORTED_IMAGE_EXTENSIONS, get_sort_key
+from .utils import (SUPPORTED_IMAGE_EXTENSIONS, extract_and_resolve_urls,
+                    get_sort_key)
 
 logger = logging.getLogger("SocialOSINTLM.llm")
 
@@ -67,7 +70,7 @@ class LLMAnalyzer:
         except Exception as e:
             self._llm_api_exception = e
 
-    def analyze_image(self, file_path: Path, context: str = "") -> Optional[str]:
+    def analyze_image(self, file_path: Path, source_url: str, context: str = "") -> Optional[str]:
         if self.is_offline:
             logger.info(f"Offline mode: Skipping LLM image analysis for {file_path}.")
             return None
@@ -119,7 +122,13 @@ class LLMAnalyzer:
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image_url", "image_url": {"url": image_data_url, "detail": "high"}}]}],
                 max_tokens=1024,
             )
-            return completion.choices[0].message.content.strip() if completion.choices[0].message.content else None
+            analysis_text = completion.choices[0].message.content.strip() if completion.choices[0].message.content else None
+            if not analysis_text:
+                return None
+            
+            # **CHANGE**: Format the output to be more structured and explicit.
+            return f"- **Image Source:** [{source_url}]({source_url})\n- **Analysis:**\n{analysis_text}"
+
         except APIError as e:
             if isinstance(e, RateLimitError): raise RateLimitExceededError("LLM Image Analysis")
             logger.error(f"LLM API error during image analysis: {e}")
@@ -197,9 +206,64 @@ class LLMAnalyzer:
 
         return "\n".join(output)
 
+    def _analyze_shared_links(self, platforms_data: Dict[str, List[Dict]]) -> str:
+        """Extracts all external links, counts domains, and returns a markdown summary."""
+        all_urls = []
+        platform_domains = {
+            "twitter.com", "x.com", "t.co", "reddit.com", "redd.it", "bsky.app",
+            "news.ycombinator.com", "youtube.com", "youtu.be" # Exclude youtube as it's too common
+        }
+
+        for platform, user_data_list in platforms_data.items():
+            for user_data in user_data_list:
+                data = user_data.get("data", {})
+                if platform == "twitter":
+                    for t in data.get("tweets", []):
+                        for url_entity in t.get("entities_raw", {}).get("urls", []):
+                            if "expanded_url" in url_entity:
+                                all_urls.append(url_entity["expanded_url"])
+                elif platform == "reddit":
+                    for s in data.get("submissions", []):
+                        if s.get("link_url"): all_urls.append(s["link_url"])
+                        if s.get("text"): all_urls.extend(extract_and_resolve_urls(s["text"]))
+                    for c in data.get("comments", []):
+                        if c.get("text"): all_urls.extend(extract_and_resolve_urls(c["text"]))
+                elif platform == "hackernews":
+                    for i in data.get("items", []):
+                        if i.get("url"): all_urls.append(i["url"])
+                        if i.get("text"): all_urls.extend(extract_and_resolve_urls(i["text"]))
+                else: # Generic text extraction for Bluesky, Mastodon
+                    for p in data.get("posts", []):
+                        if p.get("text"): all_urls.extend(extract_and_resolve_urls(p["text"]))
+                        if p.get("text_cleaned"): all_urls.extend(extract_and_resolve_urls(p["text_cleaned"]))
+
+        if not all_urls:
+            return ""
+
+        domain_counts = collections.Counter()
+        for url in all_urls:
+            try:
+                domain = urlparse(url).netloc.replace("www.", "")
+                if domain and domain not in platform_domains:
+                    domain_counts[domain] += 1
+            except Exception:
+                continue
+
+        if not domain_counts:
+            return ""
+
+        output = ["## Top Shared Domains"]
+        for domain, count in domain_counts.most_common(10):
+            output.append(f"- **{domain}:** {count} link(s)")
+        
+        return "\n".join(output)
+
     def run_analysis(self, platforms_data: Dict[str, List[Dict]], query: str) -> str:
         """Collects data summaries and uses LLM to analyze it."""
         collected_summaries, all_media_analyses = [], []
+        
+        current_ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         for platform, user_data_list in platforms_data.items():
             for user_data in user_data_list:
                 username = user_data.get("username_key", "unknown")
@@ -213,32 +277,41 @@ class LLMAnalyzer:
 
         components = []
         if all_media_analyses:
-            components.append(f"## Consolidated Media Analysis:\n\n" + "\n\n".join(sorted(list(set(all_media_analyses)))))
+            components.append("## Consolidated Media Analysis:\n\n" + "\n\n".join(sorted(list(set(all_media_analyses)))))
+        
+        shared_links_summary = self._analyze_shared_links(platforms_data)
+        if shared_links_summary:
+            components.append(shared_links_summary)
+
         if collected_summaries:
             components.append("## Collected Textual & Activity Data Summary:\n\n" + "\n\n---\n\n".join(collected_summaries))
         
-        system_prompt = """**Objective:** Generate a comprehensive behavioral and linguistic profile based on the provided social media data, employing structured analytic techniques focused on objectivity, evidence-based reasoning, and clear articulation.
+        system_prompt = f"""**Objective:** Generate a comprehensive behavioral and linguistic profile based on the provided social media data, employing structured analytic techniques focused on objectivity, evidence-based reasoning, and clear articulation.
 
-**Input:** You will receive summaries of user activity (text posts, engagement metrics, descriptive analyzes of images shared) from platforms like Twitter, Reddit, Bluesky, Mastodon, and Hacker News for one or more specified users. The user will also provide a specific analysis query. You may also receive consolidated analyzes of images shared by the user(s).
+**IMPORTANT CONTEXT: The current date and time for this analysis is {current_ts_str}.** All dates in the provided data should be interpreted relative to this timestamp.
 
-**Primary Task:** Address the user's specific analysis query using ALL the data provided (text summaries AND image analyzes if available) and the analytical framework below.
+**Input:** You will receive summaries of user activity, itemized/linked descriptive analyses of images, and a summary of top shared external domains. The user will provide a specific analysis query.
+
+**Primary Task:** Address the user's specific analysis query using ALL the data provided (text, image analyses, and shared domains) and the analytical framework below.
 
 **Analysis Domains (Use these to structure your thinking and response where relevant to the query):**
-1.  **Behavioral Patterns:** Analyze interaction frequency, platform-specific activity (e.g., retweets vs. posts, submissions vs. comments, boosts vs. original posts), potential engagement triggers, and temporal communication rhythms apparent *in the provided data*. Note differences across platforms if multiple are present. Note visibility settings (e.g., Mastodon).
-2.  **Semantic Content & Themes:** Identify recurring topics, keywords, and concepts. Analyze linguistic indicators such as expressed sentiment/tone (positive, negative, neutral, specific emotions if clear), potential ideological leanings *if explicitly stated or strongly implied by language/topics*, and cognitive framing (how subjects are discussed). Assess information source credibility *only if* the user shares external links/content within the provided data AND you can evaluate the source based on common knowledge. Note use of content warnings/spoilers. Identify languages used (e.g., from Bluesky/Mastodon data).
-3.  **Interests & Network Context:** Deduce primary interests, hobbies, or professional domains suggested by post content and image analysis. Note any interaction patterns visible *within the provided posts* (e.g., frequent replies to specific user types, retweets/boosts of particular accounts, participation in specific communities like subreddits or Mastodon hashtags/local timelines if mentioned). Look for profile metadata clues (e.g., Mastodon custom fields). Avoid inferring broad influence or definitive group membership without strong evidence.
-4.  **Communication Style:** Assess linguistic complexity (simple/complex vocabulary, sentence structure), use of jargon/slang, rhetorical strategies (e.g., humor, sarcasm, argumentation), markers of emotional expression (e.g., emoji use, exclamation points, emotionally charged words), and narrative consistency across platforms. Note use of HTML/rich text formatting (e.g., in Mastodon) or markdown (Reddit/HN).
-5.  **Network Connections & Associated Entities:** Systematically list all mentioned users, replied-to users, or boosted/retweeted accounts found in the data. For each entity, note their platform and username/handle, the nature of the interaction (e.g., "retweeted," "replied to," "mentioned in post"), and any discernible context or significance of the connection (e.g., "frequent interaction with tech-focused accounts").
-6.  **Visual Data Integration:** Explicitly incorporate insights derived from the provided image analyzes, *if available*. How do the visual elements (settings, objects, activities depicted) complement, contradict, or add context to the textual data? Note any patterns in the *types* of images shared (photos, screenshots, art) or use of alt text. If no image analysis is provided, state that visual context is missing.
-**Analytical Constraints & Guidelines:**
-*   **Evidence-Based:** Ground ALL conclusions *strictly and exclusively* on the provided source materials (text summaries AND image analyzes). Reference specific examples or patterns from the data (e.g., "Frequent posts about [topic] on Reddit," "Image analysis of setting suggests [environment]," "Consistent use of technical jargon on HackerNews", "Use of spoiler tags on Mastodon for [topic]").
-*   **Objectivity & Neutrality:** Maintain analytical neutrality. Avoid speculation, moral judgments, personal opinions, or projecting external knowledge not present in the data. Focus on describing *what the data shows*.
-*   **Synthesize, Don't Just List:** Integrate findings from different platforms and data types (text/image) into a coherent narrative that addresses the query. Highlight correlations or discrepancies.
-*   **Address the Query Directly:** Structure your response primarily around answering the user's specific question(s). Use the analysis domains as tools to build your answer.
-*   **Acknowledge Limitations:** If the data is sparse, lacks specific details needed for the query, only covers a short time period, or if certain data types (e.g., images) were unavailable/unprocessed, explicitly state these limitations (e.g., "Based on the limited posts available...", "Image analysis was not performed or available", "Mastodon data includes boosts and replies...", "Data only reflects recent activity up to N items"). Do not invent information. Mention if data collection failed for any targets.
-*   **Clarity & Structure:** Use clear language. Employ formatting (markdown headings, bullet points) to organize the response logically, often starting with a direct answer to the query followed by supporting evidence/analysis. If data collection failed for some targets, mention this early on.
+1.  **Behavioral Patterns:** Analyze interaction frequency, platform-specific activity, and temporal communication rhythms.
+2.  **Semantic Content & Themes:** Identify recurring topics, keywords, and concepts. Analyze linguistic indicators like sentiment/tone and cognitive framing.
+3.  **Interests & Network Context:** Deduce primary interests, hobbies, or professional domains. Use the **Shared Domain Analysis** to identify primary information sources. Note interaction patterns visible *within the provided posts*.
+4.  **Communication Style:** Assess linguistic complexity, use of jargon/slang, and markers of emotional expression.
+5.  **Network Connections:** Systematically list all mentioned, replied-to, or boosted/retweeted accounts found in the data, noting the nature of the interaction.
+6.  **Visual Data Integration:** Explicitly incorporate insights derived from the provided image analyses.
 
-**Output:** A structured analytical report that directly addresses the user's query, rigorously supported by evidence from the provided text and image data, adhering to all constraints. Start with a summary answer, then elaborate with details structured using relevant analysis domains. If data collection failed for some targets, mention this early on.
+**Analytical Constraints & Guidelines:**
+*   **Temporal Awareness:** Use the provided current date to correctly interpret the timeline of events. Do not rely on your internal knowledge cutoff date.
+*   **Image Link Preservation:** When citing evidence from a specific image, you MUST include the original clickable Markdown link to the `Image Source` exactly as provided. This is critical for report verifiability. DO NOT remove the link or reference the image only by its filename.
+*   **Evidence-Based:** Ground ALL conclusions *strictly and exclusively* on the provided source materials (text summaries, image analyses, and the shared domain list).
+*   **Objectivity & Neutrality:** Maintain analytical neutrality. Avoid speculation, moral judgments, or personal opinions not present in the data.
+*   **Synthesize, Don't Just List:** Integrate findings from different platforms and data types into a coherent narrative that addresses the query.
+*   **Address the Query Directly:** Structure your response primarily around answering the user's specific question(s).
+*   **Acknowledge Limitations:** If the data is sparse, lacks specific details, or if certain data types were unavailable/unprocessed, explicitly state these limitations.
+
+**Output:** A structured analytical report that directly addresses the user's query, rigorously supported by evidence from the provided text, image, and link data, adhering to all constraints.
 """
         
         user_prompt = f"**Analysis Query:** {query}\n\n**Provided Data:**\n\n" + "\n\n===\n\n".join(components)

@@ -14,13 +14,12 @@ from ..utils import SUPPORTED_IMAGE_EXTENSIONS, download_media, get_sort_key
 
 logger = logging.getLogger("SocialOSINTLM.platforms.mastodon")
 
-# Default used if no count is specified in the fetch plan
 DEFAULT_FETCH_LIMIT = 40
 
 def fetch_data(
     clients: Dict[str, Mastodon],
     default_client: Optional[Mastodon],
-    username: str, # user@instance.domain
+    username: str,
     cache: CacheManager,
     llm: LLMAnalyzer,
     force_refresh: bool = False,
@@ -32,12 +31,14 @@ def fetch_data(
         raise ValueError(f"Invalid Mastodon username format: '{username}'. Must be 'user@instance.domain'.")
 
     cached_data = cache.load("mastodon", username)
+    cached_posts_count = len(cached_data.get("posts", [])) if cached_data else 0
 
     if cache.is_offline:
         return cached_data or {"timestamp": datetime.now(timezone.utc).isoformat(), "user_info": {}, "posts": [], "media_analysis": [], "media_paths": [], "stats": {}}
 
     if not force_refresh and cached_data and (datetime.now(timezone.utc) - get_sort_key(cached_data, "timestamp")) < timedelta(hours=CACHE_EXPIRY_HOURS):
-        if len(cached_data.get("posts", [])) >= fetch_limit:
+        if cached_posts_count >= fetch_limit:
+            logger.info(f"Mastodon cache for {username} is fresh and has enough items ({cached_posts_count}/{fetch_limit}). Skipping.")
             return cached_data
 
     logger.info(f"Fetching Mastodon data for {username} (Force Refresh: {force_refresh}, Limit: {fetch_limit})")
@@ -48,7 +49,12 @@ def fetch_data(
         raise RuntimeError(f"No suitable Mastodon client found for instance {instance_domain} or for default lookup.")
 
     existing_posts = cached_data.get("posts", []) if not force_refresh and cached_data else []
-    since_id = existing_posts[0].get("id") if existing_posts and fetch_limit <= len(existing_posts) else None
+    
+    # --- Efficiency Fix ---
+    is_incremental_update = not force_refresh and cached_data and fetch_limit <= cached_posts_count
+    since_id = existing_posts[0].get("id") if is_incremental_update and existing_posts else None
+    max_id = None # Used for paginating to older posts
+
     user_info = cached_data.get("user_info") if not force_refresh and cached_data else None
     existing_media_analysis = cached_data.get("media_analysis", []) if not force_refresh and cached_data else []
     existing_media_paths = cached_data.get("media_paths", []) if not force_refresh and cached_data else []
@@ -66,48 +72,62 @@ def fetch_data(
             }
         
         user_id = user_info["id"]
-        # The Mastodon API has a hard limit of 40 per request.
-        # To fetch more, pagination would be required. For now, we respect the API limit.
-        api_limit = min(fetch_limit, 40) 
-        new_statuses = client_to_use.account_statuses(id=user_id, limit=api_limit, since_id=since_id if not force_refresh else None)
         
-        new_posts_data = []
-        newly_added_media_analysis = []
-        newly_added_media_paths = set()
+        all_fetched_posts = list(existing_posts)
+        post_ids = {p['id'] for p in all_fetched_posts}
 
-        for status in new_statuses:
-            cleaned_text = BeautifulSoup(status["content"], "html.parser").get_text(separator=" ", strip=True)
-            media_items = []
-            for att in status.get("media_attachments", []):
-                media_path = download_media(cache.base_dir, att["url"], cache.is_offline, "mastodon")
-                if media_path:
-                    analysis = llm.analyze_image(media_path, f"Mastodon user {username}'s post") if att["type"] == "image" else None
-                    media_items.append({"id": str(att["id"]), "type": att["type"], "analysis": analysis, "url": att["url"], "description": att.get("description"), "local_path": str(media_path)})
-                    if analysis: newly_added_media_analysis.append(analysis)
-                    newly_added_media_paths.add(str(media_path))
+        while len(all_fetched_posts) < fetch_limit:
+            # Mastodon API has a hard limit of 40 per request.
+            api_limit = min(fetch_limit - len(all_fetched_posts), 40)
+            if api_limit <= 0: break
             
-            reblog_info = status.get("reblog")
-            poll_info = status.get("poll")
+            # Use max_id to get OLDER posts for pagination
+            if not is_incremental_update and all_fetched_posts:
+                max_id = all_fetched_posts[-1]['id']
 
-            post_data = {
-                "id": str(status["id"]), "created_at": status["created_at"].isoformat(), "url": status["url"],
-                "text_cleaned": cleaned_text, "visibility": status.get("visibility"), "sensitive": status.get("sensitive"),
-                "spoiler_text": status.get("spoiler_text", ""), "language": status.get("language"),
-                "reblogs_count": status.get("reblogs_count", 0), "favourites_count": status.get("favourites_count", 0),
-                "is_reblog": reblog_info is not None,
-                "reblog_original_author_acct": reblog_info['account']['acct'] if reblog_info else None,
-                "reblog_original_url": reblog_info['url'] if reblog_info else None,
-                "tags": [{"name": t["name"], "url": t["url"]} for t in status.get("tags", [])],
-                "mentions": [{"acct": m["acct"], "url": m["url"]} for m in status.get("mentions", [])],
-                "poll": {"options": poll_info["options"], "votes_count": poll_info.get("votes_count")} if poll_info else None,
-                "media": media_items
-            }
-            new_posts_data.append(post_data)
+            new_statuses = client_to_use.account_statuses(id=user_id, limit=api_limit, since_id=since_id, max_id=max_id)
+            
+            if not new_statuses:
+                break # No more posts to fetch
 
-        combined = new_posts_data + existing_posts
-        final_posts = sorted(list({p['id']: p for p in combined}.values()), key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
-        final_media_analysis = sorted(list(set(newly_added_media_analysis + existing_media_analysis)))
-        final_media_paths = sorted(list(newly_added_media_paths.union(existing_media_paths)))
+            for status in new_statuses:
+                if status['id'] in post_ids: continue
+                post_ids.add(status['id'])
+                
+                cleaned_text = BeautifulSoup(status["content"], "html.parser").get_text(separator=" ", strip=True)
+                media_items = []
+                for att in status.get("media_attachments", []):
+                    media_path = download_media(cache.base_dir, att["url"], cache.is_offline, "mastodon")
+                    if media_path:
+                        analysis = llm.analyze_image(media_path, source_url=att["url"], context=f"Mastodon user {username}'s post") if att["type"] == "image" else None
+                        media_items.append({"id": str(att["id"]), "type": att["type"], "analysis": analysis, "url": att["url"], "description": att.get("description"), "local_path": str(media_path)})
+                        if analysis: existing_media_analysis.append(analysis)
+                        if media_path: existing_media_paths.append(str(media_path))
+                
+                reblog_info = status.get("reblog")
+                poll_info = status.get("poll")
+
+                post_data = {
+                    "id": str(status["id"]), "created_at": status["created_at"].isoformat(), "url": status["url"],
+                    "text_cleaned": cleaned_text, "visibility": status.get("visibility"), "sensitive": status.get("sensitive"),
+                    "spoiler_text": status.get("spoiler_text", ""), "language": status.get("language"),
+                    "reblogs_count": status.get("reblogs_count", 0), "favourites_count": status.get("favourites_count", 0),
+                    "is_reblog": reblog_info is not None,
+                    "reblog_original_author_acct": reblog_info['account']['acct'] if reblog_info else None,
+                    "reblog_original_url": reblog_info['url'] if reblog_info else None,
+                    "tags": [{"name": t["name"], "url": t["url"]} for t in status.get("tags", [])],
+                    "mentions": [{"acct": m["acct"], "url": m["url"]} for m in status.get("mentions", [])],
+                    "poll": {"options": poll_info["options"], "votes_count": poll_info.get("votes_count")} if poll_info else None,
+                    "media": media_items
+                }
+                all_fetched_posts.append(post_data)
+
+            if is_incremental_update: # Only needed one page for newest posts
+                break
+
+        final_posts = sorted(all_fetched_posts, key=lambda x: get_sort_key(x, "created_at"), reverse=True)[:max(fetch_limit, MAX_CACHE_ITEMS)]
+        final_media_analysis = sorted(list(set(existing_media_analysis)))
+        final_media_paths = sorted(list(set(existing_media_paths)))
 
         stats = {
             "total_posts_cached": len(final_posts),

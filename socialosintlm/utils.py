@@ -1,10 +1,11 @@
 import hashlib
 import json
 import logging
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -19,6 +20,8 @@ logger = logging.getLogger("SocialOSINTLM.utils")
 
 REQUEST_TIMEOUT = 20.0
 SUPPORTED_IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+# A reasonably good regex for finding URLs in text
+URL_REGEX = r'(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+'
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -54,6 +57,13 @@ def sanitize_username(username: str) -> str:
     if sanitized_user != username:
         logger.info(f"Sanitized username. Original: '{username}', Sanitized: '{sanitized_user}'")
     return sanitized_user
+
+def extract_and_resolve_urls(text: str) -> List[str]:
+    """Extracts URLs from text. Does not resolve them for performance."""
+    if not text:
+        return []
+    # Find all potential URLs in the text
+    return re.findall(URL_REGEX, text, re.IGNORECASE)
 
 def handle_rate_limit(console, platform_context: str, exception: Exception):
     """Handles rate limit exceptions by logging and printing a rich panel."""

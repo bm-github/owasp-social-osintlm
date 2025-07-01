@@ -9,9 +9,17 @@
 
 ✅ **AI-Powered Analysis:** Utilises configurable models via OpenAI-compatible APIs for sophisticated text and image analysis.
 
+✅ **Accurate Temporal Analysis:** Injects the current, real-world UTC timestamp into every analysis prompt. This forces the LLM to understand the timeline of events correctly and prevents it from making errors based on its fixed knowledge cutoff date.
+
 ✅ **Structured AI Prompts:** Employs detailed system prompts for objective, evidence-based analysis focusing on behavior, semantics, interests, and communication style.
 
+✅ **Linked Image Analysis:** Each AI-generated image analysis in the final report includes a direct, clickable link to the source image, making it easy to cross-reference and verify findings.
+
+✅ **Shared Domain Analysis:** Automatically extracts all external links shared by a user, counts the frequency of each domain, and includes a "Top Shared Domains" summary in the final report. This reveals the user's information diet, influences, and primary sources.
+
 ✅ **Vision-Capable Image Analysis:** Analyzes downloaded images (`JPEG, PNG, GIF, WEBP`) for OSINT insights using a vision-enabled LLM, focusing on objective details (setting, objects, people, text, activity). Images are pre-processed (e.g., resized to a max dimension like 1536px, first frame of GIFs).
+
+✅ **Flexible Fetch Control:** Interactively set a default fetch count for all targets. Use the `loadmore` command to incrementally fetch more data for specific users, or define a detailed "Fetch Plan" in programmatic mode to specify exact counts per target.
 
 ✅ **Efficient Media Handling:** Downloads media, stores it locally, handles platform-specific authentication (e.g., Twitter Bearer, Bluesky JWT for CDN), processes Reddit galleries, and resizes large images for analysis.
 
@@ -21,7 +29,7 @@
 
 ✅ **Robust Caching System:** Caches fetched data for 24 hours (`data/cache/`) to reduce API calls and speed up subsequent analyses. Media files are cached in `data/media/`.
 
-✅ Configurable Fetch Plan: Fetches a default number of recent items (e.g., 50), which can be precisely controlled per-target using an interactive prompt or a "Fetch Plan" in programmatic mode.
+✅ **Cache Status Overview:** An interactive command (`cache status`) to display a summary of all locally cached user data, including when it was fetched, its age, and item counts.
 
 ✅ **Offline Mode (`--offline`):** Run analysis using only locally cached data, ignores cache expiry, skipping all external network requests (social platforms, media downloads, *new* vision analysis).
 
@@ -29,13 +37,14 @@
 
 ✅ **Programmatic/Batch Mode:** Supports input via JSON from stdin for automated workflows (`--stdin`).
 
-✅ **Configurable Fetch Limits:** Fetches a defined number of recent items per platform (e.g., 50 for Twitter/Reddit/HN initial/incremental, 40 for Mastodon API limit) to balance depth and API usage.
-
 ✅ **Detailed Logging:** Logs errors and operational details to `analyzer.log`.
 
 ✅ **Environment Variable Configuration:** Easy setup using environment variables or a `.env` file, and a JSON file for Mastodon instances.
 
 ✅ **Data Purging:** Interactive option to purge cached text/metadata, media files, or output reports.
+
+<details>
+<summary><b>📈 View Workflow Flowchart</b></summary>
 
 ```mermaid
 flowchart TD
@@ -59,6 +68,8 @@ flowchart TD
     D -->|Cross-Platform| E6([Multiple Platforms])
     D -->|Purge Data| PD([Purge Data])
     PD --> C
+    D -->|Cache Status| CS([Cache Status])
+    CS --> C
     
     %% Stdin Mode Path
     B -->|Stdin| F([Parse JSON Input])
@@ -143,6 +154,7 @@ flowchart TD
     classDef mastodonClass fill:#6364FF,stroke:#4F50CC,stroke-width:3px,color:#FFF
     classDef multiClass fill:#4CAF50,stroke:#388E3C,stroke-width:3px,color:#FFF
     classDef purgeClass fill:#F44336,stroke:#D32F2F,stroke-width:3px,color:#FFF
+    classDef cacheStatusClass fill:#A5D6A7,stroke:#388E3C,stroke-width:2px,color:#1B5E20
     
     classDef loopClass fill:#E1BEE7,stroke:#8E24AA,stroke-width:2px,color:#4A148C
     classDef analysisClass fill:#BBDEFB,stroke:#1976D2,stroke-width:2px,color:#0D47A1
@@ -170,6 +182,7 @@ flowchart TD
     class E5 mastodonClass
     class E6 multiClass
     class PD purgeClass
+    class CS cacheStatusClass
     class H loopClass
     class J analysisClass
     class M cacheClass
@@ -183,8 +196,8 @@ flowchart TD
     class Z endClass
     class Y refreshClass
 ```
-
 *Flowchart Description Note:* In **Offline Mode (`--offline`)**, the "Fetch Platform Data" step and the "Download Media File" step within the Media Analysis Pipeline are *bypassed* if the data/media is not already in the cache. Analysis proceeds only with available cached information.
+</details>
 
 ## 🛠 Installation
 
@@ -278,7 +291,7 @@ Run the script as a module from the project root to start the interactive CLI.
 ```bash
 python -m socialosintlm.main
 ```
-1.  You'll be prompted to select one or more platforms.
+1.  From the main menu, you can select platforms for analysis, purge data, or view the cache status.
 2.  Enter the username(s) for the selected platform(s).
     *   **Twitter:** Usernames *without* the leading `@`.
     *   **Reddit:** Usernames *without* the leading `u/`.
@@ -288,9 +301,10 @@ python -m socialosintlm.main
 3.  Enter the default number of items to fetch per target (e.g., `50`).
 4.  Once in the analysis session, enter your queries.
 5.  **Special commands within the analysis loop:**
-    *   `loadmore <platform/user> <count>`: Fetch additional items for a target (e.g., `loadmore twitter/user101 100`).
+    *   `loadmore [<platform/user>] <count>`: Fetch additional items. If the target is unambiguous (only one user is being analyzed), you can omit `<platform/user>`. Examples: `loadmore 100`, `loadmore reddit/user123 50`.
     *   `refresh`: Re-fetch data for all targets, ignoring the 24-hour cache.
-    *   `help`: Displays available commands.
+    *   `cache status`: View a summary of all locally cached data (from main menu).
+    *   `help`: Displays available commands in the analysis session.
     *   `exit`: Returns to the main platform selection menu.
 6.  **Offline Mode Behavior:** In offline mode, the tool will only load data from the local cache (`data/cache/`). If no cache exists for a requested user/platform, analysis for that target will be skipped (a warning will be shown). No new data is fetched from social platforms, and *no new media is downloaded or analyzed*.
 
@@ -335,7 +349,7 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 *   **Media Files:** Downloaded images and media are stored in `data/media/` using hashed filenames (e.g., `{url_hash}.jpg`). These are not automatically purged by the 24-hour cache expiry but are reused if the same URL is encountered.
 *   In **Offline Mode (`--offline`)**, new data is *not* fetched, and the cache files are *not* updated or extended. The tool relies purely on the existing cache contents. New media files are *not* downloaded.
 *   Use the `refresh` command in interactive mode (online mode only) to force a bypass of the cache for the current session.
-*   Use the "Purge Data" option in the main interactive menu to selectively clear all cache, media files, or output reports.
+*   Use the "Purge Data" or "Cache Status" options in the main interactive menu to manage and inspect your local cache.
 
 ## 🔍 Error Handling & Logging
 *   **Rate Limits:** Detects API rate limits. For Twitter, Mastodon, and some LLM providers, it attempts to display the reset time and estimated wait duration. For others, it provides a general rate limit message. The specific `RateLimitExceededError` is raised internally. **Note:** Rate limit handling is bypassed in offline mode as no API calls are made.
@@ -346,17 +360,28 @@ When using `--stdin --offline`, only cached data will be used. If a platform/use
 *   **Logging:** Detailed errors and warnings are logged to `analyzer.log`. The log level can be configured using the `--log-level` argument.
 
 ## 🤖 AI Analysis Details
+*   **Accurate Timestamps:** The tool injects the current, real-world UTC timestamp into the analysis prompt. This prevents the LLM from making temporal errors (e.g., calling a recent post "in the future") due to its fixed knowledge cutoff date.
 *   **Text Analysis:**
-    *   Uses the model specified by `ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
-    *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators) per platform, *not* raw API dumps.
-    *   Guided by a detailed **system prompt** focusing on objective, evidence-based analysis across domains: Behavioral Patterns, Semantic Content, Interests/Network, Communication Style, and explicitly detailed Network Connections/Associated Entities.
-    *   **Offline Mode Impact:** The LLM is informed via the system prompt that it is running in offline mode and analysis is based *only* on potentially stale cached data. It will not have access to real-time or newly generated data. Resolution of associated entity handles/DIDs might be incomplete.
+    *   Receives **formatted summaries** of fetched data (user info, stats, recent post/comment text snippets, media presence indicators) per platform.
 *   **Image Analysis:**
-    *   Uses the vision-capable model specified by `IMAGE_ANALYSIS_MODEL` via the configured `LLM_API_BASE_URL`.
-    *   Images larger than a configurable maximum dimension (e.g., 1536px, suitable for many vision models) are resized before analysis. Animated GIFs use their first frame. Images are converted to a common format (e.g., JPEG) if necessary.
-    *   Guided by a specific **prompt** requesting objective identification of key OSINT-relevant elements (setting, objects, people details, text, activity, overall theme). Avoids speculation.
-    *   **Offline Mode Impact:** Image analysis is **only performed if the image file was already downloaded and cached** in a previous online run. New media linked in cached posts will *not* be downloaded or analyzed visually when `--offline` is used. The LLM is aware that visual context may be missing for some data points.
-*   **Integration:** The final text analysis incorporates insights derived from both the formatted text data summaries and the individual image analysis reports *that were available from the cache*.
+    *   Each analyzed image is presented with a **direct link to its source URL** for verification.
+*   **Shared Link Analysis:**
+    *   The tool automatically extracts all external URLs from the user's posts, counts the frequency of each domain, and provides a "Top Shared Domains" list.
+*   **Integration:** The final analysis is performed by an LLM guided by a detailed system prompt. It synthesizes insights from the user's text, the linked image analyses, and the shared domain summary to build a comprehensive profile and answer the user's query.
+
+### Example Report Snippet
+The data provided to the main analysis LLM is structured to be clear and verifiable. This is a simplified example of how the media and link analysis portions of the data might look before being passed to the final LLM for synthesis:
+
+> ### Consolidated Media Analysis:
+>
+> - **Analysis for Image:** [https://pbs.twimg.com/media/abc123example.jpg](https://pbs.twimg.com/media/abc123example.jpg)
+>   - **Setting/Environment:** Outdoor, urban environment, likely a public square or park.
+>   - **Key Objects/Items:** A distinctive clock tower is visible in the background. Several modern-looking benches are in the foreground.
+>
+> ### Top Shared Domains:
+> - **github.com:** 8 links
+> - **youtube.com:** 5 links
+> - **theverge.com:** 3 links
 
 ## 📸 Media Processing Details
 *   Downloads media files (images: `JPEG, PNG, GIF, WEBP`; some videos might be downloaded but not analyzed visually by default) linked in posts/tweets. **Note:** This step is skipped in Offline Mode (`--offline`) if the media is not already cached.
